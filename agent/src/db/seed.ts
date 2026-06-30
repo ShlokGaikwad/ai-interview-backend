@@ -3,7 +3,8 @@ import mongoose from "mongoose";
 import { CaseStudy } from "@ai-interview/db";
 
 const caseStudies = [
-  
+ 
+
   // Add more case studies here after running the conversion prompt.
   // Each entry must match the schema above exactly.
 ];

@@ -7,6 +7,7 @@ import { killAllAgents } from './agent-manager';
 import interviewsRouter from './routes/interviews';
 import joinRouter from './routes/join';
 import authRouter from './routes/auth';
+import settingsRouter from './routes/settings';
 import { authenticate } from './middleware/authenticate';
 
 const app = express();
@@ -18,6 +19,7 @@ app.use(cookieParser());
 
 app.use('/auth', authRouter);
 app.use('/interviews', authenticate, interviewsRouter);
+app.use('/settings', authenticate, settingsRouter);
 app.use('/join', joinRouter);
 
 app.get('/health', (_req, res) => res.json({ status: 'ok' }));

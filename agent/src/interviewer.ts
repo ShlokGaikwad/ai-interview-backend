@@ -14,12 +14,35 @@ import { createDeepgramStream } from './pipeline/stt';
 import { getNextResponse, Message } from './pipeline/llm';
 import { synthesizeSpeech } from './pipeline/tts';
 import { isHoldRequest } from './turn-taking';
-import { connectDB, Interview, Transcript, InterviewStatus, Speaker } from '@ai-interview/db';
-import { buildSystemPrompt } from './case-studies/selector';
+import { connectDB, Interview, Transcript, InterviewStatus, Speaker, Settings } from '@ai-interview/db';
+import { buildSystemPrompt, DEFAULT_VOICE_INSTRUCTIONS } from './case-studies/selector';
 
 const SAMPLE_RATE = 16000;
 const NUM_CHANNELS = 1;
 const SAMPLES_PER_CHANNEL = 480; // 30 ms per frame at 16 kHz
+
+const FAREWELL_PHRASES = [
+  'next steps will follow by email',
+  'someone from the team will follow up',
+  'we\'ll be in touch',
+  'we will be in touch',
+  'thank you for your time',
+  'thanks for your time',
+  'that\'s all i needed',
+  'that is all i needed',
+  'i have what i need',
+  'i\'ve got what i need',
+  'good luck',
+  'best of luck',
+  'goodbye',
+  'good bye',
+  'take care',
+];
+
+function isFarewell(text: string): boolean {
+  const lower = text.toLowerCase();
+  return FAREWELL_PHRASES.some((phrase) => lower.includes(phrase));
+}
 
 // Words that indicate a sentence is mid-thought — speechFinal should be ignored if transcript ends with these
 const INCOMPLETE_TRAILING = new Set([
@@ -56,6 +79,12 @@ export async function startInterviewer(roomName: string): Promise<void> {
   // Connect to MongoDB — non-fatal if unavailable, turns just won't be saved
   try {
     await connectDB();
+    // Seed default prompt into Settings if no document exists yet
+    const existing = await Settings.findOne().lean();
+    if (!existing) {
+      await Settings.create({ voiceInstructions: DEFAULT_VOICE_INSTRUCTIONS, changeHistory: [] });
+      console.log('[Agent] Seeded default voice instructions into Settings');
+    }
   } catch (err) {
     console.warn('[DB] MongoDB unavailable — transcripts will not be saved:', (err as Error).message);
   }
@@ -182,6 +211,7 @@ export async function startInterviewer(roomName: string): Promise<void> {
   }
 
   let interruptBuffer = ''; // isFinal segments captured while AI was speaking
+  let lastFinalText = '';  // guards against Deepgram sending the same segment twice (isFinal then speechFinal)
 
   async function speak(text: string): Promise<void> {
     clearSilenceTimer();
@@ -202,6 +232,11 @@ export async function startInterviewer(roomName: string): Promise<void> {
       console.error('[Agent] TTS error:', err);
     } finally {
       if (turnTimer) { clearTimeout(turnTimer); turnTimer = null; }
+
+      // If candidate disconnected mid-speech, the disconnect handler already set
+      // state = 'waiting'. Don't overwrite it or start any timers.
+      if ((state as AgentState) === 'waiting') return;
+
       state = 'listening';
 
       if (interruptBuffer) {
@@ -214,6 +249,7 @@ export async function startInterviewer(roomName: string): Promise<void> {
           if (!accumulatedTranscript || state !== 'listening') return;
           const turn = accumulatedTranscript;
           accumulatedTranscript = '';
+          lastFinalText = '';
           console.log(`[Candidate - interrupt resolved] "${turn}"`);
           await handleTurn(turn);
         }, TURN_DEBOUNCE_MS);
@@ -225,7 +261,8 @@ export async function startInterviewer(roomName: string): Promise<void> {
   }
 
   async function handleTurn(candidateText: string): Promise<void> {
-    silenceNudgeCount = 0; // candidate responded — reset nudge cycle
+    const t0 = Date.now();
+    silenceNudgeCount = 0;
     clearSilenceTimer();
     await saveTurn(Speaker.CANDIDATE, candidateText);
 
@@ -240,10 +277,32 @@ export async function startInterviewer(roomName: string): Promise<void> {
     history.push({ role: 'user', content: candidateText });
 
     try {
+      const t1 = Date.now();
       const response = await getNextResponse(systemPrompt, history);
+      const t2 = Date.now();
+      console.log(`[Timing] LLM: ${t2 - t1}ms | total to response: ${t2 - t0}ms`);
+
       history.push({ role: 'assistant', content: response });
       await saveTurn(Speaker.AI, response);
+
+      const t3 = Date.now();
       await speak(response);
+      const t4 = Date.now();
+      console.log(`[Timing] TTS+playback: ${t4 - t3}ms`);
+
+      if (isFarewell(response)) {
+        console.log('[Agent] Farewell detected — ending interview in 3s');
+        clearSilenceTimer();
+        if (turnTimer) { clearTimeout(turnTimer); turnTimer = null; }
+        // Mark completed now so candidate cannot rejoin before agent disconnects
+        if (interviewDoc) {
+          await Interview.updateOne(
+            { _id: interviewDoc._id },
+            { status: InterviewStatus.COMPLETED, endedAt: new Date() },
+          ).catch(() => null);
+        }
+        setTimeout(() => room.disconnect(), 3000);
+      }
     } catch (err) {
       console.error('[Agent] LLM error:', err);
       state = 'listening';
@@ -276,26 +335,36 @@ export async function startInterviewer(roomName: string): Promise<void> {
 
           if (state !== 'listening') return;
 
-          // Live interim display — also clears silence timer as soon as candidate starts talking
+          // Live interim display — clears silence timer and resets turn timer while
+          // candidate is actively speaking (interim results prove they haven't stopped yet)
           if (segment.text) {
             clearSilenceTimer();
+            if (!segment.isFinal && turnTimer) {
+              clearTimeout(turnTimer);
+              turnTimer = null;
+            }
             const preview = (accumulatedTranscript + ' ' + segment.text).trim();
             process.stdout.write(`\r[Candidate] ${preview}   `);
           }
 
-          if (segment.isFinal && segment.text) {
+          if (segment.isFinal && segment.text && segment.text !== lastFinalText) {
             accumulatedTranscript = (accumulatedTranscript + ' ' + segment.text).trim();
+            lastFinalText = segment.text;
           }
 
           // speechFinal means Deepgram's VAD detected end of speech — but the candidate
           // may just be pausing between sentences. Never fire immediately; always wait a
-          // short buffer so they can continue. Delay varies by how complete the sentence looks:
-          //   - Complete (3+ words, no trailing fragment): 1200ms — likely done, small safety gap
+          // buffer so they can continue. Delay varies by turn phase and completeness:
+          //   - Early turns (intro phase, turnCount < 4): 2500ms — candidates speak in
+          //     multiple short sentences with natural breathing gaps between them
+          //   - Later turns (question phase): 2000ms — answers are more self-contained
           //   - Short or trailing incomplete word: 3600ms — almost certainly continuing
           if (segment.speechFinal && accumulatedTranscript) {
             const wordCount = accumulatedTranscript.trim().split(/\s+/).length;
             const incomplete = looksIncomplete(accumulatedTranscript);
-            const delay = wordCount >= 3 && !incomplete ? 1200 : TURN_DEBOUNCE_MS * 2;
+            const completeDelay = turnCount < 4 ? 2500 : 2000;
+            const delay = wordCount >= 3 && !incomplete ? completeDelay : TURN_DEBOUNCE_MS * 2;
+            const speechFinalAt = Date.now();
 
             if (turnTimer) clearTimeout(turnTimer);
             turnTimer = setTimeout(async () => {
@@ -303,7 +372,9 @@ export async function startInterviewer(roomName: string): Promise<void> {
               if (!accumulatedTranscript || state !== 'listening') return;
               const turn = accumulatedTranscript;
               accumulatedTranscript = '';
+              lastFinalText = '';
               process.stdout.write('\n');
+              console.log(`[Timing] Debounce wait: ${Date.now() - speechFinalAt}ms (planned: ${delay}ms)`);
               console.log(`[Candidate - final] "${turn}"`);
               await handleTurn(turn);
             }, delay);
@@ -312,13 +383,16 @@ export async function startInterviewer(roomName: string): Promise<void> {
 
           if (segment.isFinal && segment.text) {
             // Fallback debounce in case speechFinal never fires
+            const isFinalAt = Date.now();
             if (turnTimer) clearTimeout(turnTimer);
             turnTimer = setTimeout(async () => {
               turnTimer = null;
               if (!accumulatedTranscript || state !== 'listening') return;
               const turn = accumulatedTranscript;
               accumulatedTranscript = '';
+              lastFinalText = '';
               process.stdout.write('\n');
+              console.log(`[Timing] Debounce wait (fallback): ${Date.now() - isFinalAt}ms (planned: ${TURN_DEBOUNCE_MS}ms)`);
               console.log(`[Candidate - final (debounce)] "${turn}"`);
               await handleTurn(turn);
             }, TURN_DEBOUNCE_MS);
@@ -340,7 +414,32 @@ export async function startInterviewer(roomName: string): Promise<void> {
   );
 
   async function greetCandidate(identity: string): Promise<void> {
-    if (greeted) return;
+    if (greeted) {
+      // Candidate reconnected after a drop — run recovery
+      console.log(`[Agent] Candidate reconnected: ${identity}`);
+      await new Promise((r) => setTimeout(r, 1500));
+      state = 'processing';
+      try {
+        const tempHistory: Message[] = [
+          ...history,
+          {
+            role: 'user',
+            content: '[You got disconnected and the person just rejoined. Acknowledge the drop briefly and naturally — like a real person would on a call ("Oh looks like we got cut off"). Then in one sentence remind them what you were just talking about and continue from there. Keep it casual, max 2 sentences.]',
+          },
+        ];
+        const resumeMsg = await getNextResponse(systemPrompt, tempHistory);
+        history.push({ role: 'assistant', content: resumeMsg });
+        await saveTurn(Speaker.AI, resumeMsg);
+        await speak(resumeMsg);
+      } catch (err) {
+        console.error('[Agent] Reconnect recovery failed:', err);
+        const fallback = "Oh looks like we got cut off — no worries. Where were we?";
+        await saveTurn(Speaker.AI, fallback);
+        await speak(fallback);
+      }
+      return;
+    }
+
     greeted = true;
     console.log(`[Agent] Greeting candidate: ${identity}`);
 
@@ -356,15 +455,13 @@ export async function startInterviewer(roomName: string): Promise<void> {
     await new Promise((r) => setTimeout(r, 1500));
 
     if (isRecovery) {
-      // History is fully loaded from DB — ask the LLM to generate a contextual recovery
-      // message that recaps what it last said and re-asks any pending question.
-      // The trigger is not saved to the transcript or persisted in history.
+      // Candidate reconnected after a drop — resume naturally without sounding robotic
       try {
         const tempHistory: Message[] = [
           ...history,
           {
             role: 'user',
-            content: '[The candidate just reconnected after a connection drop. Welcome them back briefly, recap the last thing you said in one sentence, and re-ask any unanswered question. Maximum 3 sentences total.]',
+            content: '[You got disconnected and the person just rejoined. Acknowledge the drop briefly and naturally — like a real person would on a call ("Oh looks like we got cut off"). Then in one sentence remind them what you were just talking about and continue from there. Keep it casual, max 2 sentences.]',
           },
         ];
         const resumeMsg = await getNextResponse(systemPrompt, tempHistory);
@@ -373,7 +470,7 @@ export async function startInterviewer(roomName: string): Promise<void> {
         await speak(resumeMsg);
       } catch (err) {
         console.error('[Agent] Recovery LLM call failed:', err);
-        const fallback = "Welcome back — it looks like we got disconnected. Let's pick up where we left off.";
+        const fallback = "Oh looks like we got cut off — no worries. Where were we?";
         await saveTurn(Speaker.AI, fallback);
         await speak(fallback);
       }
@@ -391,13 +488,31 @@ export async function startInterviewer(roomName: string): Promise<void> {
     }
   }
 
-  // Greet participant who joins after the agent
+  // Stop everything when candidate disconnects — don't speak to an empty room
+  room.on(RoomEvent.ParticipantDisconnected, (participant: RemoteParticipant) => {
+    if (participant.identity.startsWith('observer-')) return;
+    console.log(`[Agent] Candidate disconnected: ${participant.identity} — pausing`);
+    speakCancelled = true;
+    if (turnTimer) { clearTimeout(turnTimer); turnTimer = null; }
+    clearSilenceTimer();
+    accumulatedTranscript = '';
+    interruptBuffer = '';
+    state = 'waiting';
+  });
+
+  // Greet participant who joins after the agent — ignore silent observers
   room.on(RoomEvent.ParticipantConnected, (participant: RemoteParticipant) => {
+    if (participant.identity.startsWith('observer-')) {
+      console.log(`[Agent] Observer joined — skipping greeting: ${participant.identity}`);
+      return;
+    }
     void greetCandidate(participant.identity);
   });
 
   // Safety net: greet candidate already in room (e.g. joined before agent finished starting)
-  const existing = [...room.remoteParticipants.values()];
+  const existing = [...room.remoteParticipants.values()].filter(
+    (p) => !p.identity.startsWith('observer-'),
+  );
   if (existing.length > 0) {
     console.log('[Agent] Candidate already in room — greeting immediately');
     void greetCandidate(existing[0].identity);
