@@ -2,3 +2,10 @@ node_modules/
 dist/
 .env
 *.log
+
+# Local realtime test/dev scripts (not needed in the repo; seed.ts is kept)
+src/scripts/test-realtime-connection.ts
+src/scripts/test-realtime-audio-out.ts
+
+# Test artifacts
+*.wav

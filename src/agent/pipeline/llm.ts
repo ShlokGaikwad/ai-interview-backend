@@ -19,7 +19,7 @@ class OpenAIProvider implements LLMProvider {
 
   async complete(systemPrompt: string, messages: Message[]): Promise<string> {
     const res = await this.client.chat.completions.create({
-      model: process.env.LLM_MODEL ?? "gpt-4o-mini",
+      model: process.env.LLM_MODEL!, // set in .env; ! asserts it's defined for the type checker
       messages: [{ role: "system", content: systemPrompt }, ...messages],
     });
     return res.choices[0].message.content ?? "";
@@ -40,7 +40,7 @@ class AnthropicProvider implements LLMProvider {
 
   async complete(systemPrompt: string, messages: Message[]): Promise<string> {
     const res = await this.client.messages.create({
-      model: process.env.LLM_MODEL ?? "claude-sonnet-4-6",
+      model: process.env.LLM_MODEL!, // set in .env; ! asserts it's defined for the type checker
       max_tokens: 1024,
       system: systemPrompt,
       messages,
@@ -51,7 +51,7 @@ class AnthropicProvider implements LLMProvider {
 }
 
 const provider: LLMProvider = (() => {
-  const p = (process.env.LLM_PROVIDER ?? "openai").toLowerCase();
+  const p = process.env.LLM_PROVIDER!.toLowerCase(); // set in .env; ! asserts it's defined
   if (p === "anthropic") return new AnthropicProvider();
   return new OpenAIProvider();
 })();
