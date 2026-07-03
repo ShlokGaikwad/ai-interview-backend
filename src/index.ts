@@ -13,7 +13,7 @@ import { authenticate } from './middleware/authenticate';
 const app = express();
 const PORT = process.env.PORT || 8000;
 
-app.use(cors({ origin: process.env.FRONTEND_URL ?? 'http://localhost:3000', credentials: true }));
+app.use(cors({ origin: process.env.FRONTEND_URL, credentials: true }));
 app.use(express.json());
 app.use(cookieParser());
 

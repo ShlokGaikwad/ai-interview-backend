@@ -1,7 +1,8 @@
 import { spawn, ChildProcess } from 'child_process';
 import path from 'path';
 
-const AGENT_DIR = path.resolve(__dirname, '../../agent');
+// Project root is one level up from src/ (dev) or dist/ (prod).
+const PROJECT_ROOT = path.resolve(__dirname, '..');
 const running = new Map<string, ChildProcess>();
 
 export function spawnAgent(interviewId: string, roomName: string): void {
@@ -10,14 +11,20 @@ export function spawnAgent(interviewId: string, roomName: string): void {
     return;
   }
 
+  // The agent is a module in this same package (src/agent). In dev we run it with
+  // ts-node (+ tsconfig-paths so the @ai-interview/db alias resolves); in prod we run
+  // the compiled dist/agent/index.js. cwd is the project root so the spawned agent's
+  // dotenv loads the single root .env.
   const isDev = process.env.NODE_ENV !== 'production';
   const command = isDev
-    ? path.join(AGENT_DIR, 'node_modules', '.bin', 'ts-node')
+    ? path.join(PROJECT_ROOT, 'node_modules', '.bin', 'ts-node')
     : 'node';
-  const args = isDev ? ['src/index.ts'] : ['dist/index.js'];
+  const args = isDev
+    ? ['-r', 'tsconfig-paths/register', 'src/agent/index.ts']
+    : ['dist/agent/index.js'];
 
   const child = spawn(command, args, {
-    cwd: AGENT_DIR,
+    cwd: PROJECT_ROOT,
     env: { ...process.env, LIVEKIT_ROOM_NAME: roomName, INTERVIEW_ID: interviewId },
     stdio: 'pipe',
   });

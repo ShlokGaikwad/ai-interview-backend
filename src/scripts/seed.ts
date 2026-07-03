@@ -2,11 +2,11 @@ import "dotenv/config";
 import mongoose from "mongoose";
 import { CaseStudy } from "@ai-interview/db";
 
-const caseStudies = [
- 
+type CaseStudySeed = { slug: string; title: string; [key: string]: unknown };
 
-  // Add more case studies here after running the conversion prompt.
-  // Each entry must match the schema above exactly.
+const caseStudies: CaseStudySeed[] = [
+  // Add case studies here after running the conversion prompt.
+  // Each entry must match the CaseStudy schema exactly.
 ];
 
 async function seed() {
