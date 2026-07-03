@@ -6,7 +6,9 @@
     "dev": "ts-node-dev --respawn src/index.ts",
     "build": "tsc",
     "start": "node dist/index.js",
-    "seed": "ts-node src/db/seed.ts"
+    "seed": "ts-node src/db/seed.ts",
+    "test:realtime": "ts-node src/scripts/test-realtime-connection.ts",
+    "test:realtime:audioout": "ts-node src/scripts/test-realtime-audio-out.ts"
   },
   "dependencies": {
     "@ai-interview/db": "*",
@@ -16,10 +18,12 @@
     "dotenv": "^16.4.5",
     "elevenlabs": "^0.17.0",
     "livekit-server-sdk": "^2.6.0",
-    "openai": "^4.56.0"
+    "openai": "^4.56.0",
+    "ws": "^8.21.0"
   },
   "devDependencies": {
     "@types/node": "^22.0.0",
+    "@types/ws": "^8.18.1",
     "ts-node-dev": "^2.0.0",
     "typescript": "^5.5.0"
   }
